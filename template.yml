@@ -1,0 +1,169 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "Creates a function and an SNS topic that uses the account email to notify the account owner that access keys are getting old and need to be rotated "
+
+Parameters:
+  NotificationTopicName:
+  Type: String
+
+   AlertAfterNDays: #Number of days before expiry to start sending notifications
+   Type: String
+
+   NotificationInterval: #Number of days between each notification
+   Type: String
+
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AccessKeyNotificationLambdaExecutionRole
+      ManagedPolicyArns:
+        - arn:aws:iam:aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AllowSendToSNSAndCheckForAccessKeys
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Sid: Allow1
+                Action: 
+                  - "sns:Publish"
+                  - "sns:Subscribe"
+                  - "sns:ListSubscriptionsByTopic"
+                  - "iam:ListAccessKeys"
+                Resource:
+                  - !Sub "arn:aws:iam:${AWS::ACCOUNTID}:/user/*"
+                  - !Ref NotificationTopic
+              - Effect: Allow
+                Sid: Allow2
+                Action:
+                  - "iam:ListUsers"
+                Resource:
+                  - "*"
+              
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: 
+              Service: 
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Ref NotificationTopicName
+  
+  AccessKeyNotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          from collections import defaultdict
+          from datetime import datetime, timezone
+          import logging
+
+          import boto3
+          from botocore.exceptions import ClientError
+
+          iam_client = boto3.client('iam')
+          sns_client = boto3.client('sns')
+          org_client = boto3.client('organization')
+
+          def is_subscribed(notificationTopicArn):
+            # Get account information for current account in order to get the email address
+            account = org_client.describe_account()
+            email = account["Account"]["Email"]
+            # Get subscriptions on sns topic to see if account email is subscribed
+            subscriptions = sns_client.list_subscriptions_by_topic(TopicArn=notificationTopicArn)
+            # Go through all subscriptions to sns topic to determine if account email is there.
+            for subscription in subscriptions["Subscriptions"]:
+              if subscription["protocol"] == "email" and subscription["email"] == email:
+                return True
+            return False
+
+
+          def subscribe_account_email(topicArn, email, sns_client):
+            response = sns_client.subscribe(TopicArn=TOPIC_ARN, Protocol="email", Endpoint=email)
+
+          def get_account_users():
+            is_truncated = True
+            marker = None
+            users = []
+            while is_truncated:
+              if marker None:
+                response = iam_client.list_users()
+              else:
+                response = iam_client.list_users(Marker=marker)
+              users.extend(response['Users'])
+              is_truncated = response['IsTruncated']
+              marker = response.get("Marker", None)
+
+            return users
+
+          def remove_invalid(access_keys):
+            valid_keys = access_keys
+            if access_keys not None and len(access_keys) > 0:
+              consumed_days = (datetime.now(timezone.utc) - key["CreateDate"]).days
+              for key in access_keys:
+                if key["Status"] == "Active" and consumed_days < alert_limit:
+                  valid_keys.remove(key)
+            return valid_keys
+
+          def get_valid_access_keys():
+            keys_by_user = {}
+            users = get_account_users()
+            if not users:
+              return keys_by_user
+            for user in users:
+              response = iam_client.list_access_keys(user["UserName"])
+              access_keys = response["AccessKeyMetadata"]
+              access_keys = remove_invalid(access_keys)
+              if access_keys:
+                keys_by_user[user] = access_keys
+            return keys_by_user
+
+
+          def notify(keys_by_user):
+            email_text = f'''Hello,
+            This is an automatic reminder to rotate your AWS access keys that are older than {ALERT_AFTER_N_DAYS} days
+
+            You currently have {len(keys_by_user)} key(s) that should be replaced:\n '''
+            for key, value in keys_by_user.item():
+              email_text += f" - {key}\n"
+              for access_key in value:
+                email_text += f"{access_key['AccessKeyId']} Created: {access_key['CreateDate']} ({(datetime.now(timezone.utc) - key['CreateDate']).days} days ago)\n\n"
+              email_text += f"""  If you don't know how to rotate your keys, please see the official documentation: https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html#Using_RotateAccessKey
+              This message will be sent again in {NOTIFICATION_INTERVAL} days if the keys are not rotated
+              """
+
+              sns_client.publish(TopicArn=TOPIC_ARN, Message=email_text, Subject="Access key rotation reminder")
+
+          def lambda_handler(event, context):
+            if !is_subscribed(notificationTopicArn):
+              subscribe_account_email(topicArn, email)
+              logging.error("Email not subscribed. Subscribing and exiting")
+              return
+            logging.info("Email is subscribed")
+            keys_by_user = get_valid_access_keys()
+            if not keys_by_user:
+              logging.info("No keys exists or no keys are due for replacement")
+              return
+            notify(keys_by_user)
+        
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref TopicArn
+          NOTIFICATION_INTERVAL: !Ref NotificationInterval
+          ALERT_AFTER_N_DAYS: !Ref AlertAfterNDays
+      MemorySize: 128
+      Runtime: python3.7
+      Timeout: 30
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+
+            
+
